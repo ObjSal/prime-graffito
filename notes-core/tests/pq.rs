@@ -718,14 +718,86 @@ fn compose_directed_note_pq_exact_amount_coin_control() {
 #[test]
 fn argon2_production_params_direct() {
     let salt = [0x5au8; 16];
-    let out = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P);
+    let out = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
     assert_eq!(out.len(), 32);
     // Deterministic for the same inputs.
-    let out2 = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P);
+    let out2 = pw_key("production parameter check", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
     assert_eq!(out, out2);
     // Different password -> different key.
-    let out3 = pw_key("different password", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P);
+    let out3 = pw_key("different password", &salt, pq::PW_PROD_T, pq::PW_PROD_M_LOG2, pq::PW_PROD_P).unwrap();
     assert_ne!(out, out3);
+    // Production params must always sit within the decode caps — a prod
+    // bump past the caps would emit notes every peer rejects (the
+    // raise-the-cap-first rule on PW_MAX_M_LOG2/PW_MAX_T).
+    assert!(pq::PW_PROD_M_LOG2 <= pq::PW_MAX_M_LOG2);
+    assert!(pq::PW_PROD_T <= pq::PW_MAX_T);
+}
+
+/// Guards the 2026-08-22 fallible-allocation refactor (audit F2) and any
+/// future argon2 crate bump: `pw_key` must stay byte-identical at BOTH the
+/// original (m_log2=16) and current (15) production params — vectors
+/// captured from the pre-refactor implementation. A mismatch means
+/// already-sealed FLAG_PW notes stop unlocking: SHIP-BLOCKING, never
+/// "fix the hex".
+#[test]
+fn pw_key_vectors_are_pinned() {
+    let salt = [0x5au8; 16];
+    let v16 = pw_key("graffito pinned vector", &salt, 3, 16, 1).unwrap();
+    assert_eq!(
+        hex::encode(v16),
+        "fad9b05640e82dc3b10856d820ee43b57029b9ec5233d378a16005fa57856e73"
+    );
+    let v15 = pw_key("graffito pinned vector", &salt, 3, 15, 1).unwrap();
+    assert_eq!(
+        hex::encode(v15),
+        "cf62ed0e748cd55190ce559438fc3af03d477ab106bf79176c66fa1125ae589e"
+    );
+}
+
+/// 2026-08-22 audit F1: `(t, m_log2, p)` are attacker-controlled on-chain
+/// bytes and Argon2 allocates `2^m_log2` KiB up front, so the decode caps
+/// must reject a hostile demand BEFORE any allocation (`Error::Decode`).
+/// Reaching `DecryptFailed` instead proves the params were ACCEPTED — the
+/// arena was allocated and the AEAD ran — which is asserted for the
+/// boundary values so the cap sits exactly where it claims.
+#[test]
+fn hostile_argon2_params_are_rejected_at_decode() {
+    let a = identity(31);
+    let b = identity(32);
+    let outpoint = [0x77u8; 36];
+    let locked = |t: u8, m_log2: u8, p: u8| {
+        let mut body = vec![0u8; 16]; // salt
+        body.push(t);
+        body.push(m_log2);
+        body.push(p);
+        body.extend_from_slice(&[0u8; 64]); // fake sealed blob
+        LockedBody {
+            pq_flags: FLAG_PW,
+            body,
+            sender_x: a.output_x,
+            recipient_x: b.output_x,
+            outpoint,
+        }
+    };
+    let unlock =
+        |t, m, p| unlock_received(&locked(t, m, p), &b.tweaked_seckey, None, Some("pw"));
+
+    // The pre-audit cap admitted up to 24 (a 16 GiB arena). Now: > 16 is
+    // undecodable, as are Argon2's own out-of-range minimums.
+    assert!(matches!(unlock(3, 24, 1).unwrap_err(), Error::Decode(_)), "m_log2=24 (16 GiB)");
+    assert!(matches!(unlock(3, 17, 1).unwrap_err(), Error::Decode(_)), "m_log2=17");
+    assert!(matches!(unlock(17, 15, 1).unwrap_err(), Error::Decode(_)), "t=17");
+    assert!(matches!(unlock(0, 15, 1).unwrap_err(), Error::Decode(_)), "t=0");
+    assert!(matches!(unlock(3, 15, 0).unwrap_err(), Error::Decode(_)), "p=0");
+
+    // Boundary acceptance: m_log2=16 (the original prod value — every
+    // pre-audit FLAG_PW note) and t=16 pass validation and fail only at
+    // the AEAD tag (the blob here is garbage).
+    assert!(
+        matches!(unlock(3, 16, 1).unwrap_err(), Error::DecryptFailed),
+        "m_log2=16 must stay decodable"
+    );
+    assert!(matches!(unlock(16, 15, 1).unwrap_err(), Error::DecryptFailed), "t=16");
 }
 
 #[test]

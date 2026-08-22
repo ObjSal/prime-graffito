@@ -64,6 +64,12 @@ pub enum Error {
     /// secret was encapsulated to the RECIPIENT only, so the sender can
     /// never re-open their own sent pq-KEM note.
     SenderCannotReopen,
+    /// `pq.rs`: the Argon2 memory arena for a password layer could not be
+    /// allocated (`pw_key`'s fallible `try_reserve_exact`) — on-device
+    /// free heap is smaller than the note's `m` parameter demands. A clean
+    /// error where the infallible allocation path would ABORT the process
+    /// (2026-08-22 audit F2).
+    OutOfMemory,
 }
 
 impl core::fmt::Display for Error {
@@ -92,6 +98,9 @@ impl core::fmt::Display for Error {
             }
             Error::SenderCannotReopen => {
                 write!(f, "sender cannot re-open a post-quantum-sealed note (KEM secret is recipient-only)")
+            }
+            Error::OutOfMemory => {
+                write!(f, "not enough free memory for this note's password protection")
             }
         }
     }

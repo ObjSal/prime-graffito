@@ -515,22 +515,54 @@ pub fn mlkem_keypair_from_leaf(leaf_secret: &[u8; 32], alg: MlKemAlg) -> MlKemKe
 // Argon2id password layer
 // ---------------------------------------------------------------------
 
-/// Production Argon2id parameters (Sal's brief): t=3 iterations, m=2^16 KiB
-/// (64 MiB), p=1 lane.
+/// Production Argon2id parameters: t=3 iterations, m=2^15 KiB (32 MiB),
+/// p=1 lane.
+///
+/// `m` was 2^16 (64 MiB, Sal's original brief) until the 2026-08-22 crypto
+/// audit (F2, `private/SECURITY-AUDIT-CRYPTO-2026-08-22.md`): a Passport
+/// Prime has ~59-60 MB of free heap, so a single 64 MiB Argon2 allocation
+/// plausibly fails on hardware — and both apps must EMIT one value the
+/// weakest platform can also UNLOCK, or Mac-sealed FLAG_PW notes become
+/// unreadable on device. 32 MiB at t=3 still clears RFC 9106's and OWASP's
+/// recommended Argon2id floors. Notes already sealed at m=2^16 remain
+/// decodable everywhere the memory exists ([`validate_pw_params`] accepts
+/// up to 16) — the wire prefix self-describes its params, so this constant
+/// only shapes NEW notes and is safe to lower again (never raise past the
+/// decode cap without bumping the cap a release earlier).
 pub const PW_PROD_T: u32 = 3;
-pub const PW_PROD_M_LOG2: u8 = 16;
+pub const PW_PROD_M_LOG2: u8 = 15;
 pub const PW_PROD_P: u32 = 1;
 
-/// Reasonable bounds on parsed (untrusted, on-chain) Argon2 params — guards
-/// [`pw_key`]'s documented panic precondition against a malformed/hostile
-/// PW prefix block. `m_log2` is capped well under the 32-bit shift width
-/// (and under any sane device memory budget); `t`/`p` just need to be >= 1
-/// (Argon2's own minimums).
+/// Decode-side cap on a received note's `m_log2`. These params are
+/// ATTACKER-CONTROLLED on-chain bytes, and Argon2 allocates `2^m_log2` KiB
+/// up front — before the 2026-08-22 audit (F1) this cap was 24, letting a
+/// hostile note demand a 16 GiB allocation at unlock time (an instant
+/// process abort on a 128 MB device, an OOM grind elsewhere). 16 is the
+/// largest value any honest emitter has EVER written ([`PW_PROD_M_LOG2`]
+/// was 16 from the feature's ship date until the same audit lowered it to
+/// 15), so capping here rejects nothing legitimate. If production params
+/// are ever raised past 16, ship the cap bump one release BEFORE the
+/// emitter bump, or old builds will reject the new notes.
+pub const PW_MAX_M_LOG2: u8 = 16;
+/// Decode-side cap on a received note's `t` (pass count). Honest emitters
+/// have only ever written [`PW_PROD_T`] = 3; 16 leaves generous headroom
+/// while bounding the CPU an attacker can demand (255 passes over a
+/// 64 MiB arena ≈ minutes of compute per unlock attempt). Same
+/// raise-the-cap-first rule as [`PW_MAX_M_LOG2`].
+pub const PW_MAX_T: u32 = 16;
+
+/// Bounds on parsed (untrusted, on-chain) Argon2 params — guards
+/// [`pw_key`] against a malformed/hostile PW prefix block. `m_log2` and
+/// `t` are capped at [`PW_MAX_M_LOG2`]/[`PW_MAX_T`] (see those consts for
+/// the threat model); `t`/`p` need to be >= 1 (Argon2's own minimums).
 fn validate_pw_params(t: u32, m_log2: u8, p: u32) -> Result<(), Error> {
     if t < 1 || p < 1 || p > 0x00ff_ffff {
         return Err(Error::Decode("pq: invalid argon2 params"));
     }
-    if m_log2 > 24 {
+    if t > PW_MAX_T {
+        return Err(Error::Decode("pq: argon2 pass count too large"));
+    }
+    if m_log2 > PW_MAX_M_LOG2 {
         return Err(Error::Decode("pq: argon2 memory cost too large"));
     }
     let m_cost = 1u32 << m_log2;
@@ -541,23 +573,42 @@ fn validate_pw_params(t: u32, m_log2: u8, p: u32) -> Result<(), Error> {
 }
 
 /// Argon2id(v0x13) key derivation: `m = 2^m_log2` KiB, `t` iterations, `p`
-/// lanes, 32-byte output. Precondition: `(t, m_log2, p)` must already be
-/// valid Argon2 parameters (production callers use [`PW_PROD_T`] /
-/// [`PW_PROD_M_LOG2`] / [`PW_PROD_P`], which always are; callers parsing
-/// `(t, m_log2, p)` off the chain MUST run [`validate_pw_params`] first —
+/// lanes, 32-byte output. `(t, m_log2, p)` must already be valid Argon2
+/// parameters (production callers use [`PW_PROD_T`] / [`PW_PROD_M_LOG2`] /
+/// [`PW_PROD_P`], which always are; callers parsing `(t, m_log2, p)` off
+/// the chain MUST run [`validate_pw_params`] first —
 /// `unlock_received`/`unlock_sent` do this before ever calling `pw_key`).
-/// Panics if the precondition is violated (never reachable from this
+/// Invalid params return `Error::Decode` (never reachable from this
 /// module's own decode paths).
-pub fn pw_key(password: &str, salt: &[u8; 16], t: u32, m_log2: u8, p: u32) -> [u8; 32] {
+///
+/// The Argon2 memory arena is allocated FALLIBLY (`try_reserve_exact` +
+/// `hash_password_into_with_memory`) and a failure returns
+/// [`Error::OutOfMemory`] — 2026-08-22 audit F2: on a Passport Prime
+/// (~59-60 MB free heap) the infallible-allocation path
+/// (`hash_password_into`, which `vec![...]`s the arena) turns "not enough
+/// memory for these params" into an uncatchable process ABORT. Same
+/// blocks, same algorithm, byte-identical output — pinned by
+/// `pw_key_vectors_are_pinned` in tests/pq.rs.
+pub fn pw_key(
+    password: &str,
+    salt: &[u8; 16],
+    t: u32,
+    m_log2: u8,
+    p: u32,
+) -> Result<[u8; 32], Error> {
     let m_cost = 1u32 << m_log2;
     let params = argon2::Params::new(m_cost, t, p, Some(32))
-        .expect("caller must validate argon2 params before calling pw_key");
+        .map_err(|_| Error::Decode("pq: invalid argon2 params"))?;
+    let block_count = params.block_count();
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut blocks: Vec<argon2::Block> = Vec::new();
+    blocks.try_reserve_exact(block_count).map_err(|_| Error::OutOfMemory)?;
+    blocks.resize(block_count, argon2::Block::default());
     let mut out = [0u8; 32];
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut out)
-        .expect("fixed 32-byte output always fits Argon2's output bounds");
-    out
+        .hash_password_into_with_memory(password.as_bytes(), salt, &mut out, &mut blocks)
+        .map_err(|_| Error::Decode("pq: invalid argon2 params"))?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------
@@ -669,7 +720,7 @@ pub fn seal_directed_pq(
     if let Some(password) = layers.password {
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt).map_err(|_| Error::Entropy)?;
-        let key = pw_key(password, &salt, PW_PROD_T, PW_PROD_M_LOG2, PW_PROD_P);
+        let key = pw_key(password, &salt, PW_PROD_T, PW_PROD_M_LOG2, PW_PROD_P)?;
         prefix.extend_from_slice(&salt);
         prefix.push(PW_PROD_T as u8);
         prefix.push(PW_PROD_M_LOG2);
@@ -811,7 +862,7 @@ pub fn unlock_received(
         let (params, rest) = parse_pw_prefix(body)?;
         body = rest;
         let pw = password.ok_or(Error::NeedsPassword)?;
-        pw_key_bytes = Some(pw_key(pw, &params.salt, params.t, params.m_log2, params.p));
+        pw_key_bytes = Some(pw_key(pw, &params.salt, params.t, params.m_log2, params.p)?);
     }
 
     let shared_x = dm::ecdh_shared_x(my_tweaked_seckey, &locked.sender_x)?;
@@ -842,10 +893,62 @@ pub fn unlock_sent(
 
     let (params, rest) = parse_pw_prefix(&locked.body)?;
     let pw = password.ok_or(Error::NeedsPassword)?;
-    let pw_key_bytes = pw_key(pw, &params.salt, params.t, params.m_log2, params.p);
+    let pw_key_bytes = pw_key(pw, &params.salt, params.t, params.m_log2, params.p)?;
 
     let shared_x = dm::ecdh_shared_x(my_tweaked_seckey, &locked.recipient_x)?;
     let key = derive_pq_key(locked.pq_flags, None, &shared_x, None, Some(&pw_key_bytes));
     let aad = dm::dm_aad(my_output_x, &locked.recipient_x, &locked.outpoint);
     crypt::open_aad(&key, &aad, rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A FLAG_PW note sealed under the ORIGINAL production params
+    /// (t=3, m_log2=16, p=1 — what every PW note carried before the
+    /// 2026-08-22 audit lowered [`PW_PROD_M_LOG2`] to 15) must still
+    /// unlock: the decode cap ([`PW_MAX_M_LOG2`] = 16) deliberately
+    /// admits the old value, and `pw_key`'s fallible-allocation refactor
+    /// is byte-preserving (also pinned by `pw_key_vectors_are_pinned` in
+    /// tests/pq.rs). Uses the private `derive_pq_key` to reconstruct the
+    /// exact sealing the old emitter performed, since the public seal
+    /// path now writes m_log2=15.
+    #[test]
+    fn old_prod_params_still_unlock() {
+        let a = crate::bundle::Identity::from_app_seed(&[7u8; 32]).unwrap();
+        let b = crate::bundle::Identity::from_app_seed(&[8u8; 32]).unwrap();
+        let outpoint = [0x44u8; 36];
+        let salt = [0x5au8; 16];
+        let (t, m_log2, p) = (3u32, 16u8, 1u32);
+
+        let pwk = pw_key("legacy m16 password", &salt, t, m_log2, p).unwrap();
+        let shared = dm::ecdh_shared_x(&a.tweaked_seckey, &b.output_x).unwrap();
+        let key = derive_pq_key(FLAG_PW, None, &shared, None, Some(&pwk));
+        let aad = dm::dm_aad(&a.output_x, &b.output_x, &outpoint);
+        let sealed = crypt::seal_aad(&key, &aad, b"pre-audit note").unwrap();
+
+        let mut body = Vec::with_capacity(19 + sealed.len());
+        body.extend_from_slice(&salt);
+        body.push(t as u8);
+        body.push(m_log2);
+        body.push(p as u8);
+        body.extend_from_slice(&sealed);
+        let locked = LockedBody {
+            pq_flags: FLAG_PW,
+            body,
+            sender_x: a.output_x,
+            recipient_x: b.output_x,
+            outpoint,
+        };
+
+        let pt = unlock_received(&locked, &b.tweaked_seckey, None, Some("legacy m16 password"))
+            .unwrap();
+        assert_eq!(pt, b"pre-audit note");
+        // And the sender's own re-read path accepts the old params too.
+        let pt2 =
+            unlock_sent(&locked, &a.tweaked_seckey, &a.output_x, Some("legacy m16 password"))
+                .unwrap();
+        assert_eq!(pt2, b"pre-audit note");
+    }
 }
